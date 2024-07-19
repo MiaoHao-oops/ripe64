@@ -59,6 +59,7 @@ struct char_payload {
   char *buffer;
 
   jmp_buf *jmp_buffer;
+  unsigned long setjmp_guard;
   void *old_base_ptr;  // used to mangle the overflow pointer
   char *stack_buffer;  // used for r2libc and rop attack on jmp_buf
 
@@ -110,7 +111,7 @@ boolean is_attack_possible();
 boolean are_variables_well_located(uintptr_t buffer, uintptr_t target_addr, uintptr_t overflow_ptr);
 void homebrew_memcpy(void *dst, const void *src, size_t len);
 
-int  find_gadget_offset(char* search_chars);
+int  find_gadget_offset(char* search_chars, size_t search_chars_count);
 void gadget1(int a, int b);
 void gadget2(int a, int b);
 int  gadget3(int a, int b);
@@ -125,7 +126,7 @@ void gadget4(int a, int b);
 #elif __arm__
    #define ROTATE 0x0
 #else
-   #error The exploit does not support this architecture
+   #define ROTATE 0x0
 #endif
 
 unsigned long rol(uintptr_t value) {

